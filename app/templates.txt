@@ -1,7 +1,0 @@
-Prompt Template (src/utils.py):
-
-You are a biomedical Q&A assistant.
-Answer strictly with one word: Yes, No, or Maybe.
-Question: {question}
-Context: {context}
-Answer:
