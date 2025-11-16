@@ -1,24 +1,234 @@
 import os
+import re
 import requests
 import streamlit as st
 import numpy as np
 import pandas as pd
 import torch
+import torch.nn as nn
+from transformers import AutoTokenizer, AutoModel
+from openai import OpenAI
 
-# Google Drive download links
-URL_CONTEXT = "https://drive.google.com/uc?export=download&id=1e4BwDZaqNPe-8i3KHZskvIlVIUdRb6Fb" # https://drive.google.com/file/d/1e4BwDZaqNPe-8i3KHZskvIlVIUdRb6Fb/view?usp=sharing
-URL_PARQUET = "https://drive.google.com/uc?export=download&id=1zx4RAR_csv4sutBDg2RuNcWH-UxR1WoB" # https://drive.google.com/file/d/1zx4RAR_csv4sutBDg2RuNcWH-UxR1WoB/view?usp=sharing
-URL_MODEL = "https://drive.google.com/uc?export=download&id=1RNPiTK52eXe47WyKANLxMZ1OiAtS4eo5" # https://drive.google.com/file/d/1RNPiTK52eXe47WyKANLxMZ1OiAtS4eo5/view?usp=sharing
+# ----------------------------
+# 0. Streamlit page config
+# ----------------------------
+st.set_page_config(
+    page_title="PubMedQA Biomedical QA",
+    page_icon="🧬",
+    layout="wide"
+)
+
+st.title("🧬 PubMedQA – Biomedical Question Answering")
+st.write(
+    "Ask a biomedical question. The app retrieves PubMed-style abstracts "
+    "with a dual-encoder and then generates a simple answer using GPT-4o-mini, "
+    "strictly grounded in the retrieved evidence."
+)
+
+# ----------------------------
+# 1. Download artifacts from Google Drive (only if missing)
+# ----------------------------
+URL_CONTEXT = "https://drive.google.com/uc?export=download&id=1e4BwDZaqNPe-8i3KHZskvIlVIUdRb6Fb"
+URL_PARQUET = "https://drive.google.com/uc?export=download&id=1zx4RAR_csv4sutBDg2RuNcWH-UxR1WoB"
+URL_MODEL = "https://drive.google.com/uc?export=download&id=1RNPiTK52eXe47WyKANLxMZ1OiAtS4eo5"
 
 def download_file(url, filename):
     if not os.path.exists(filename):
         with st.spinner(f"Downloading {filename} ..."):
             r = requests.get(url, allow_redirects=True)
-            open(filename, 'wb').write(r.content)
-            st.success(f"{filename} downloaded.")
+            r.raise_for_status()
+            with open(filename, "wb") as f:
+                f.write(r.content)
+        st.success(f"{filename} downloaded.")
 
-# Ensure files exist
 download_file(URL_CONTEXT, "context_embs_pubmedqa.npy")
 download_file(URL_PARQUET, "df_all_pubmedqa.parquet")
 download_file(URL_MODEL, "dual_encoder_pubmedqa.pt")
 
+# ----------------------------
+# 2. Device
+# ----------------------------
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# ----------------------------
+# 3. Load data and embeddings
+# ----------------------------
+@st.cache_resource(show_spinner=True)
+def load_data():
+    df_all_local = pd.read_parquet("df_all_pubmedqa.parquet")
+    context_embs_local = np.load("context_embs_pubmedqa.npy")
+    return df_all_local, context_embs_local
+
+df_all, context_embs = load_data()
+
+# ----------------------------
+# 4. DualEncoder model
+# ----------------------------
+max_length = 128
+model_name = "microsoft/BiomedNLP-PubMedBERT-base-uncased-abstract-fulltext"
+tokenizer = AutoTokenizer.from_pretrained(model_name)
+
+class DualEncoder(nn.Module):
+    def __init__(self, encoder_name):
+        super().__init__()
+        self.encoder = AutoModel.from_pretrained(encoder_name)
+        self.hidden_size = self.encoder.config.hidden_size
+    def encode(self, input_ids, attention_mask):
+        outputs = self.encoder(input_ids=input_ids, attention_mask=attention_mask)
+        token_embs = outputs.last_hidden_state  # [B, L, H]
+        cls_emb = token_embs[:, 0, :]          # [B, H]
+        cls_emb = cls_emb / cls_emb.norm(p=2, dim=1, keepdim=True).clamp(min=1e-8)
+        return cls_emb
+    def forward(self, q_input_ids, q_attention_mask, c_input_ids, c_attention_mask):
+        q_emb = self.encode(q_input_ids, q_attention_mask)
+        c_emb = self.encode(c_input_ids, c_attention_mask)
+        return q_emb, c_emb
+
+@st.cache_resource(show_spinner=True)
+def load_dual_encoder():
+    model = DualEncoder(model_name).to(device)
+    state_dict = torch.load("dual_encoder_pubmedqa.pt", map_location=device)
+    model.load_state_dict(state_dict)
+    model.eval()
+    return model
+
+dual_encoder = load_dual_encoder()
+
+# ----------------------------
+# 5. OpenAI client (API key from secrets/env/key.txt)
+# ----------------------------
+def load_openai_client():
+    api_key = None
+
+    # 1) Streamlit secrets (recommended for deployment)
+    try:
+        if "OPENAI_API_KEY" in st.secrets:
+            api_key = st.secrets["OPENAI_API_KEY"]
+        elif "openai" in st.secrets and "api_key" in st.secrets["openai"]:
+            api_key = st.secrets["openai"]["api_key"]
+    except Exception:
+        api_key = None
+
+    # 2) Environment variable (for local dev)
+    if api_key is None:
+        api_key = os.getenv("OPENAI_API_KEY", None)
+
+    # 3) key.txt fallback (your local file)
+    if api_key is None and os.path.exists("key.txt"):
+        with open("key.txt", "r") as f:
+            api_key = f.read().strip()
+
+    if api_key is None:
+        st.error(
+            "OpenAI API key not found. Set it in Streamlit secrets as "
+            "`OPENAI_API_KEY`, or in the environment, or in a local key.txt file."
+        )
+        st.stop()
+
+    os.environ["OPENAI_API_KEY"] = api_key
+    return OpenAI(api_key=api_key)
+
+client = load_openai_client()
+
+# ----------------------------
+# 6. Retrieval function
+# ----------------------------
+def retrieve_topk_docs(question, top_k_docs=3):
+    dual_encoder.eval()
+    enc = tokenizer(
+        question,
+        padding=True,
+        truncation=True,
+        max_length=max_length,
+        return_tensors="pt"
+    )
+    with torch.no_grad():
+        q_emb = dual_encoder.encode(
+            enc["input_ids"].to(device),
+            enc["attention_mask"].to(device)
+        ).cpu().numpy()[0]
+    sims = context_embs @ q_emb
+    ranked_indices = np.argsort(-sims)
+    docs = []
+    for rank_pos in range(top_k_docs):
+        cid = ranked_indices[rank_pos]
+        score = sims[cid]
+        ctx = df_all.loc[df_all["id"] == cid, "context"].values[0]
+        docs.append((score, cid, ctx))
+    return docs
+
+# ----------------------------
+# 7. Semi-strict GPT-4o-mini answer generator
+# ----------------------------
+def generate_plain_answer_gpt4o(question, docs, max_chars_per_doc=400):
+    snippets = []
+    for score, cid, ctx in docs:
+        snippets.append(ctx[:max_chars_per_doc])
+    evidence_text = "\n\n".join(snippets)
+
+    prompt = f"""
+You are a biomedical assistant.
+You MUST answer using ONLY the evidence below.
+You ARE allowed to:
+- infer likely meaning if multiple snippets point in the same direction,
+- paraphrase or summarize what the evidence implies,
+- generalize a little ONLY if the evidence strongly suggests it.
+
+You are NOT allowed to:
+- use outside medical knowledge,
+- add unsupported facts,
+- contradict the evidence.
+
+Question:
+{question}
+
+Evidence:
+{evidence_text}
+
+OUTPUT RULES:
+1. Start with EXACTLY one of:
+   - Short answer: Yes.
+   - Short answer: No.
+   - Short answer: It leans toward yes.
+   - Short answer: It leans toward no.
+   - Short answer: Unclear.
+
+2. Then add 1–2 simple sentences summarizing what the evidence suggests.
+3. If evidence is indirect, incomplete, or off-topic -> choose "Short answer: Unclear."
+"""
+
+    response = client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0.0
+    )
+    return response.choices[0].message.content
+
+# ----------------------------
+# 8. Streamlit UI – ask + show answer & evidence
+# ----------------------------
+st.subheader("Ask a biomedical question")
+
+question = st.text_input(
+    "Type your question here:",
+    placeholder="e.g., Does smoking increase the risk of heart attack?"
+)
+
+top_k = st.slider("Number of evidence documents to show:", 1, 5, 2)
+run_button = st.button("Run QA")
+
+if run_button and question.strip():
+    with st.spinner("Retrieving relevant articles and generating answer..."):
+        docs = retrieve_topk_docs(question, top_k_docs=top_k)
+        answer = generate_plain_answer_gpt4o(question, docs)
+
+    st.markdown("### Short Answer")
+    st.write(answer)
+
+    st.markdown("### Evidence Snippets from Retrieved Articles")
+    for rank_pos, (score, cid, ctx) in enumerate(docs, start=1):
+        sentences = re.split(r'(?<=[.!?])\s+', ctx)
+        sentences = [s.strip() for s in sentences if len(s.strip()) > 0]
+        snippet = " ".join(sentences[:2])[:400] + "..."
+        st.markdown(f"**Document {rank_pos}** (similarity: `{score:.3f}`, id: `{cid}`)")
+        st.write(snippet)
